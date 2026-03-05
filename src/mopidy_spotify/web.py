@@ -13,7 +13,7 @@ from http import HTTPStatus
 
 import requests
 
-from mopidy_spotify import utils
+from mopidy_spotify import Extension, utils, authenticate
 
 logger = logging.getLogger(__name__)
 
@@ -38,8 +38,10 @@ class OAuthClient:
         *,
         base_url,
         refresh_url,
+        authentication_provider,
         client_id=None,
         client_secret=None,
+        cache_credentials_path,
         proxy_config=None,
         expiry_margin=60,
         timeout=10,
@@ -51,6 +53,9 @@ class OAuthClient:
         else:
             self._auth = None
         self._access_token = None
+        self._credentials = None
+        self._authentication_provider = authentication_provider
+        self._cache_credentials_path = cache_credentials_path
 
         self._base_url = base_url
         self._refresh_url = refresh_url
@@ -110,6 +115,7 @@ class OAuthClient:
 
         # Make sure our headers always override user supplied ones.
         kwargs.setdefault("headers", {}).update(self._headers)
+
         result = self._request_with_retries("GET", path, *args, **kwargs)
 
         if result is None or "error" in result:
@@ -145,10 +151,23 @@ class OAuthClient:
             msg = "Lock must be held before calling."
             raise OAuthTokenRefreshError(msg)
 
-        data = {"grant_type": "client_credentials"}
-        result = self._request_with_retries(
-            "POST", self._refresh_url, auth=self._auth, data=data
-        )
+        if self._authentication_provider == Extension.Provider.SPOTIFY_DIRECT:
+            if self._auth:
+                session = authenticate.SpotifyDirectAuthentication(
+                    client_id=self._auth[0], 
+                    client_secret=self._auth[1],
+                    refresh_url=self._refresh_url,
+                    credentials=self._credentials,
+                    cache_credentials_path=self._cache_credentials_path,
+                )
+                result = session.fetch_token()
+            else:
+                result = None
+        else:
+            data = {"grant_type": "client_credentials"}
+            result = self._request_with_retries(
+                "POST", self._refresh_url, auth=self._auth, data=data
+            )
 
         if result is None:
             msg = "Unknown error."
@@ -164,6 +183,7 @@ class OAuthClient:
             raise OAuthTokenRefreshError(msg)
 
         self._access_token = result["access_token"]
+        self._credentials = result
         self._headers["Authorization"] = f"Bearer {self._access_token}"
         self._expires = time.time() + result.get("expires_in", float("Inf"))
 
@@ -500,18 +520,30 @@ API_MAX_IDS_PER_REQUEST = {
 
 class SpotifyOAuthClient(OAuthClient):
     TRACK_FIELDS = (
-        "next,items(track(type,uri,name,duration_ms,disc_number,track_number,"
+        "next,items(item(type,uri,name,duration_ms,disc_number,track_number,"
         "artists,album,is_playable,linked_from.uri))"
     )
-    PLAYLIST_FIELDS = f"name,owner(id),type,uri,snapshot_id,tracks({TRACK_FIELDS}),"
+    PLAYLIST_FIELDS = f"name,owner(id),type,uri,snapshot_id,items({TRACK_FIELDS}),"
+    ALBUM_FIELDS = f"name,owner(id),type,uri,snapshot_id,items({TRACK_FIELDS}),"
     DEFAULT_EXTRA_EXPIRY = 10
 
-    def __init__(self, *, refresh_url, client_id, client_secret, proxy_config):
+    def __init__(
+        self,
+        *,
+        refresh_url,
+        authentication_provider,
+        client_id,
+        client_secret,
+        cache_credentials_path,
+        proxy_config,
+    ):
         super().__init__(
             base_url="https://api.spotify.com/v1",
             refresh_url=refresh_url,
+            authentication_provider=authentication_provider,
             client_id=client_id,
             client_secret=client_secret,
+            cache_credentials_path=cache_credentials_path,
             proxy_config=proxy_config,
         )
         self.user_id = None
@@ -545,7 +577,8 @@ class SpotifyOAuthClient(OAuthClient):
     def get_user_playlists(self, *, refresh=False):
         expiry_strategy = ExpiryStrategy.FORCE_EXPIRED if refresh else None
         pages = self.get_all(
-            f"users/{self.user_id}/playlists",
+            # f"users/{self.user_id}/playlists", #TODO: BHA
+            'me/playlists',
             params={"limit": 50},
             expiry_strategy=expiry_strategy,
         )
@@ -555,7 +588,7 @@ class SpotifyOAuthClient(OAuthClient):
     def _with_all_tracks(self, obj, params=None):
         if params is None:
             params = {}
-        tracks_path = obj.get("tracks", {}).get("next")
+        tracks_path = obj.get("items", {}).get("next")
         track_pages = self.get_all(
             tracks_path,
             params=params,
@@ -573,8 +606,8 @@ class SpotifyOAuthClient(OAuthClient):
         if more_tracks:
             # Take a copy to avoid changing the cached response.
             obj = copy.deepcopy(obj)
-            obj.setdefault("tracks", {}).setdefault("items", [])
-            obj["tracks"]["items"] += more_tracks
+            obj.setdefault("items", {}).setdefault("items", [])
+            obj["items"]["items"] += more_tracks
 
         return obj
 
@@ -604,24 +637,22 @@ class SpotifyOAuthClient(OAuthClient):
 
         links = list(dict.fromkeys(links))  # Remove duplicates and maintain order
         for batch in utils.batched(links, API_MAX_IDS_PER_REQUEST[link_type]):
-            ids = [u.id for u in batch]
             ids_to_links = {u.id: u for u in batch}
-            data = self.get_one(
-                f"{link_type}s", params={"ids": ",".join(ids), "market": "from_token"}
-            )
-            for item in data.get(f"{link_type}s") or []:
-                if not item:
-                    continue
+            for id in ids_to_links:
+                data = self.get_one(
+                    f"{link_type}s/{id}",
+                    params={"market": "from_token"}
+                )
 
                 # For track re-linking.
-                if "linked_from" in item:
-                    item_id = item["linked_from"].get("id")
+                if "linked_from" in data:
+                    item_id = data["linked_from"].get("id")
                 else:
-                    item_id = item.get("id")
+                    item_id = data.get("id")
                 if link := ids_to_links.get(item_id):
-                    yield link, WebResponse.from_batch(data, item)
+                    yield link, WebResponse.from_batch(data, data)
                 else:
-                    logger.warning(f"Invalid batch item: {item}")
+                    logger.warning(f"Invalid batch item: {data}")
 
     def get_albums(self, album_links):
         result = {}
